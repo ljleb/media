@@ -135,6 +135,64 @@ def make_hsv(
     return torch.stack([h, s, v], dim=0)
 
 
+def oklch_to_rgb(
+    l: torch.Tensor | float,
+    c: torch.Tensor | float,
+    h: torch.Tensor | float,
+) -> torch.Tensor:
+    """
+    Convert OKLCH to sRGB.
+
+    Args:
+        l: lightness, usually around [0, 1]
+        c: chroma, usually around [0, 0.3] for safe sRGB use
+        h: hue, normalized so 1.0 = one full turn
+
+    Returns:
+        Tensor shaped [3, ...] in sRGB space, clamped to [0, 1].
+    """
+    dtype, device = _infer_dtype_device(l, c, h)
+    if not isinstance(l, torch.Tensor):
+        l = torch.as_tensor(l, device=device, dtype=dtype)
+    if not isinstance(c, torch.Tensor):
+        c = torch.as_tensor(c, device=device, dtype=dtype)
+    if not isinstance(h, torch.Tensor):
+        h = torch.as_tensor(h, device=device, dtype=dtype)
+
+    l, c, h = torch.broadcast_tensors(l, c, h)
+
+    angle = h * (2 * torch.pi)
+    a = c * torch.cos(angle)
+    b = c * torch.sin(angle)
+
+    # OKLab -> LMS'
+    l_ = l + 0.3963377774 * a + 0.2158037573 * b
+    m_ = l - 0.1055613458 * a - 0.0638541728 * b
+    s_ = l - 0.0894841775 * a - 1.2914855480 * b
+
+    # LMS' -> LMS
+    l3 = l_ ** 3
+    m3 = m_ ** 3
+    s3 = s_ ** 3
+
+    # linear RGB
+    r_lin = +4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3
+    g_lin = -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3
+    b_lin = -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3
+
+    rgb_lin = torch.stack([r_lin, g_lin, b_lin], dim=0)
+
+    # linear RGB -> sRGB
+    threshold = 0.0031308
+    rgb = torch.where(
+        rgb_lin <= threshold,
+        12.92 * rgb_lin,
+        1.055 * torch.clamp_min(rgb_lin, 0.0).pow(1 / 2.4) - 0.055,
+    )
+
+    return rgb.clamp(0.0, 1.0)
+
+
 def hsv_to_rgb(hsv: torch.Tensor) -> torch.Tensor:
     """
     Convert a 3-channel HSV tensor to RGB.
@@ -306,6 +364,14 @@ def hsv_to_b(hsv: torch.Tensor) -> torch.Tensor:
     return b.unsqueeze(-3)
 
 
+def hsv_to(idx: int, hsv: torch.Tensor) -> torch.Tensor:
+    return {
+        0: hsv_to_r,
+        1: hsv_to_g,
+        2: hsv_to_b,
+    }[idx](hsv)
+
+
 def tv_static_mask(
     image: torch.Tensor,
     amount: float = 0.3,
@@ -351,52 +417,115 @@ def scanlines(
     thickness: int = 2,
     radial: bool = False,
 ) -> torch.Tensor:
+    """
+    Approximate the original canvas scanlines effect:
+      1. draw black scanline geometry
+      2. apply layer opacity
+      3. composite over image with overlay blend mode
+
+    Args:
+        image: Tensor of shape [..., 3, H, W], usually in [0, 1].
+        spacing: Distance between scanlines in pixels.
+        thickness: Scanline thickness in pixels.
+        opacity: Scanline layer opacity in [0, 1].
+        radial: If False, horizontal scanlines. If True, radial/spoked scanlines.
+
+    Returns:
+        Tensor of shape [..., 3, H, W].
+    """
     if image.ndim < 3 or image.shape[-3] != 3:
         raise ValueError("image must have shape [..., 3, H, W]")
+    if not torch.is_floating_point(image):
+        image = image.float()
 
     spacing = max(1, int(spacing))
     thickness = max(1, int(thickness))
+
+    h, w = image.shape[-2:]
     device = image.device
     dtype = image.dtype
     leading_ndim = image.ndim - 3
-    h, w = image.shape[-2:]
+    pad = [1] * leading_ndim
 
-    if radial:
-        yy = torch.arange(h, device=device, dtype=dtype).view(*([1] * leading_ndim), 1, h, 1)
-        xx = torch.arange(w, device=device, dtype=dtype).view(*([1] * leading_ndim), 1, 1, w)
+    if not radial:
+        y = torch.arange(h, device=device).view(*pad, 1, h, 1)
+        mask = (y.remainder(spacing) < thickness).to(dtype)
+    else:
+        yy = torch.arange(h, device=device, dtype=dtype).view(*pad, 1, h, 1)
+        xx = torch.arange(w, device=device, dtype=dtype).view(*pad, 1, 1, w)
+
         cy = (h - 1) * 0.5
         cx = (w - 1) * 0.5
-        radius = torch.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-        lines = ((radius.remainder(spacing)) < thickness).to(dtype)
-    else:
-        yy = torch.arange(h, device=device).view(*([1] * leading_ndim), 1, h, 1)
-        lines = ((yy.remainder(spacing)) < thickness).to(dtype)
 
-    return image * (1.0 - lines)
+        dy = yy - cy
+        dx = xx - cx
+
+        radius = torch.sqrt(dx * dx + dy * dy)
+        theta = torch.atan2(dy, dx)
+
+        # Original radial version loops every 2 degrees.
+        sector = math.radians(2.0)
+        angular_distance = torch.remainder(theta + 0.5 * sector, sector) - 0.5 * sector
+
+        # Approximate perpendicular distance from nearest spoke.
+        spoke_distance = radius * angular_distance.abs()
+
+        # Original draws repeated short filled rectangles along each rotated spoke.
+        dash_mask = radius.remainder(spacing) < max(1.0, spacing - 1.0)
+        mask = ((spoke_distance < (0.5 * thickness)) & dash_mask).to(dtype)
+
+    # Canvas overlay blend with a black source layer:
+    #   overlay(base, 0) = 2*base*0                when base <= 0.5
+    #                    = 1 - 2*(1-base)*(1-0)   when base > 0.5
+    #                    = 0                      when base <= 0.5
+    #                    = 2*base - 1             when base > 0.5
+    overlay_black = torch.where(
+        image <= 0.5,
+        torch.zeros_like(image),
+        2.0 * image - 1.0,
+    )
+
+    return image * (1.0 - mask) + overlay_black * mask
 
 
 def vhs_distortion(
     uv: torch.Tensor,
-    strength: float = 0.4,
+    strength: float = 0.04,
+    bands: int = 18,
     *,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     if uv.ndim < 3 or uv.shape[-3] != 2:
         raise ValueError("uv must have shape [..., 2, H, W]")
 
-    strength = float(max(0.0, strength))
+    strength = float(strength)
+    bands = max(1, int(bands))
+
     leading = uv.shape[:-3]
-    h, _ = uv.shape[-2:]
+    h = uv.shape[-2]
+    device = uv.device
+    dtype = uv.dtype
+
     u, v = uv.unbind(dim=-3)
 
-    num_bands = max(1, int(10 + strength * 20))
-    band_height = max(1, h // num_bands)
-    band_ids = torch.arange(h, device=uv.device) // band_height
-    band_ids = band_ids.clamp_max(num_bands - 1)
+    offsets = torch.rand(
+        *leading,
+        bands,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ) * 2.0 - 1.0
 
-    offsets = torch.rand(*leading, num_bands, device=uv.device, dtype=uv.dtype, generator=generator)
-    offsets = offsets * (strength * 0.1)
-    offset_map = offsets[..., band_ids].unsqueeze(-1)
+    offsets = offsets * strength
+
+    band_idx = torch.linspace(
+        0,
+        bands - 1,
+        h,
+        device=device,
+    ).round().to(torch.long)
+
+    offset_map = offsets[..., band_idx].unsqueeze(-1)
 
     return torch.stack((u + offset_map, v), dim=-3)
 
@@ -443,6 +572,48 @@ def stretch_smear(
     return out
 
 
+def echo_trails(
+    image: torch.Tensor,
+    amount: float = 0.5,
+    direction: float = 0.0,
+) -> torch.Tensor:
+    """
+    Pixel-space echo trail shift.
+
+    Args:
+        image: Tensor of shape [..., C, H, W].
+        amount: Normalized amount. 1.0 means max offset = 10% of image width.
+        direction: Direction in radians.
+
+    Returns:
+        Shifted echo layer of shape [..., C, H, W].
+
+    Notes:
+        This returns only the shifted echo layer. Blend externally, e.g.:
+            out = torch.lerp(image, echo_trails(image, amount, direction), 0.5)
+    """
+    if image.ndim < 3:
+        raise ValueError("image must have shape [..., C, H, W]")
+
+    h, w = image.shape[-2:]
+    device = image.device
+
+    max_offset = w * 0.1 * float(amount)
+
+    dx = int(round(math.cos(float(direction)) * max_offset))
+    dy = int(round(math.sin(float(direction)) * max_offset))
+
+    # Positive dx/dy means the visible echo moves right/down.
+    # Inverse sampling fills every output pixel by reading from the opposite direction.
+    src_y = torch.arange(h, device=device) - dy
+    src_x = torch.arange(w, device=device) - dx
+
+    src_y = src_y.clamp(0, h - 1)
+    src_x = src_x.clamp(0, w - 1)
+
+    return image.index_select(-2, src_y).index_select(-1, src_x)
+
+
 def echo_trail_uv(
     uv: torch.Tensor,
     amount: float = 0.5,
@@ -461,6 +632,75 @@ def echo_trail_uv(
 
 
 def pixelate(
+    image: torch.Tensor,
+    size: int = 8,
+    intensity: float = 1.0,
+    random_areas: float = 0.0,
+    *,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """
+    Pixel-space pixelation matching the original parameters.
+
+    Args:
+        image: Tensor of shape [..., C, H, W].
+        size: Pixel block size.
+        intensity: Blend amount between original and pixelated image.
+        random_areas: Probability of applying pixelation per block.
+        generator: Optional torch random generator.
+
+    Returns:
+        Tensor of shape [..., C, H, W].
+    """
+    if image.ndim < 3:
+        raise ValueError("image must have shape [..., C, H, W]")
+
+    block = max(2, int(size))
+    intensity = max(0.0, min(1.0, float(intensity)))
+    random_areas = max(0.0, min(1.0, float(random_areas)))
+
+    h, w = image.shape[-2:]
+    device = image.device
+    dtype = image.dtype
+
+    y0 = (torch.arange(h, device=device) // block) * block
+    x0 = (torch.arange(w, device=device) // block) * block
+    yy, xx = torch.meshgrid(y0, x0, indexing="ij")
+
+    pixelated = image[..., :, yy, xx]
+
+    if random_areas > 0.0:
+        rows = (h + block - 1) // block
+        cols = (w + block - 1) // block
+
+        block_mask = (
+            torch.rand(
+                *image.shape[:-3],
+                1,
+                rows,
+                cols,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
+            < random_areas
+        ).to(dtype)
+
+        by = torch.arange(h, device=device) // block
+        bx = torch.arange(w, device=device) // block
+        block_mask = block_mask[..., :, by[:, None], bx[None, :]]
+
+        target = torch.where(block_mask.bool(), pixelated, image)
+    else:
+        target = pixelated
+
+    if intensity >= 1.0:
+        return target
+
+    return torch.lerp(image, target, intensity)
+
+
+def pixelate_uv(
     uv: torch.Tensor,
     size: int = 8,
 ) -> torch.Tensor:
@@ -672,3 +912,53 @@ def corrupt_edges(
                 out[..., :, y:y + gh, dst_x1:dst_x2] = source[..., :, y:y + gh, src_x1:src_x2]
 
     return out.clamp(0.0, 1.0)
+
+
+def rgb_spatial_shift(
+    image: torch.Tensor,
+    red_offset: tuple[int, int] = (0, 0),
+    green_offset: tuple[int, int] = (0, 0),
+    blue_offset: tuple[int, int] = (0, 0),
+) -> torch.Tensor:
+    """
+    RGB channel spatial shift in pixel space.
+
+    Args:
+        image: Tensor of shape [..., 3, H, W].
+        red_offset: (dx, dy) pixel offset for the red channel.
+        green_offset: (dx, dy) pixel offset for the green channel.
+        blue_offset: (dx, dy) pixel offset for the blue channel.
+
+    Returns:
+        Tensor of shape [..., 3, H, W].
+
+    Notes:
+        Uses inverse sampling with clamp-to-edge fill, matching the original
+        canvas implementation's clampPixel behavior.
+    """
+    if image.ndim < 3 or image.shape[-3] != 3:
+        raise ValueError("image must have shape [..., 3, H, W]")
+
+    h, w = image.shape[-2:]
+    device = image.device
+
+    def shift_channel(channel: torch.Tensor, offset: tuple[int, int]) -> torch.Tensor:
+        dx, dy = int(offset[0]), int(offset[1])
+
+        # Inverse sampling:
+        # output[y, x] reads input[y + dy, x + dx].
+        # This matches the original source-read convention:
+        # data[x] = tempData[x + offset].
+        src_y = torch.arange(h, device=device) + dy
+        src_x = torch.arange(w, device=device) + dx
+
+        src_y = src_y.clamp(0, h - 1)
+        src_x = src_x.clamp(0, w - 1)
+
+        return channel.index_select(-2, src_y).index_select(-1, src_x)
+
+    r = shift_channel(image[..., 0, :, :], red_offset)
+    g = shift_channel(image[..., 1, :, :], green_offset)
+    b = shift_channel(image[..., 2, :, :], blue_offset)
+
+    return torch.stack((r, g, b), dim=-3)
