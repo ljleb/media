@@ -1,3 +1,5 @@
+Renders from this repository rely on the [tensor_image library](https://github.com/ljleb/tensor_image).
+
 ## License
 
 © 2026 ljleb
@@ -9,5 +11,3 @@ Attribution should be given as:
 > Code and/or media by ljleb  
 > Licensed under CC BY-NC-ND 4.0  
 > Repository: https://github.com/ljleb/media
-
-Renders from this repository rely on the [tensor_image library](https://github.com/ljleb/tensor_image).
