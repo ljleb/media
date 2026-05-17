@@ -4,7 +4,7 @@ Renders from this repository rely on the [tensor_image library](https://github.c
 
 © 2026 ljleb
 
-Unless otherwise stated, the source materials in this repository and rendered outputs published by ljleb from them are licensed under the Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License.
+Unless otherwise stated, the source materials in this repository and rendered outputs from them published by ljleb are licensed under the Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License.
 
 Attribution should be given as:
 
