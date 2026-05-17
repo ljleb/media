@@ -1,6 +1,6 @@
 import torch
 from tensor_image import save_image
-from effects import dilate2d, make_hsv, hsv_to_rgb, oklch_to_rgb, scanlines, vhs_distortion, corrupt_edges, circuit_bend, echo_trail_uv, rgb_spatial_shift, echo_trails, pixelate
+from tensor_image.effects import dilate2d, make_hsv, hsv_to_rgb, oklch_to_rgb, scanlines, vhs_distortion, corrupt_edges, circuit_bend, echo_trail_uv, rgb_spatial_shift, echo_trails, pixelate
 
 height = 4096
 width = 4096
